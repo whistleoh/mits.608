@@ -5,7 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
-
+#include "spinlock.h"
+#include "proc.h"
 /*
  * the kernel's page table.
  */
@@ -45,6 +46,37 @@ kvminit()
   // map the trampoline for trap entry/exit to
   // the highest virtual address in the kernel.
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+}
+
+pagetable_t
+proc_kvminit()
+{
+
+  pagetable_t proc_kpagetable = (pagetable_t) kalloc();
+
+  memset(proc_kpagetable, 0, PGSIZE);
+
+  proc_kvmmap(proc_kpagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  proc_kvmmap(proc_kpagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+  // proc_kvmmap(proc_kpagetable, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+
+  proc_kvmmap(proc_kpagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+
+  proc_kvmmap(proc_kpagetable, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+
+  proc_kvmmap(proc_kpagetable, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+
+  proc_kvmmap(proc_kpagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  return proc_kpagetable;
+}
+
+void
+proc_kvmmap(pagetable_t pagetable,uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  if(mappages(pagetable, va, sz, pa, perm) != 0)
+    panic("kvmmap");
 }
 
 // Switch h/w page table register to the kernel's page table,
@@ -131,8 +163,9 @@ kvmpa(uint64 va)
   uint64 off = va % PGSIZE;
   pte_t *pte;
   uint64 pa;
-  
-  pte = walk(kernel_pagetable, va, 0);
+  struct cpu *c = mycpu();
+  struct proc *p = c->proc;
+  pte = walk(p->k_pagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
   if((*pte & PTE_V) == 0)
@@ -335,6 +368,43 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   return -1;
 }
 
+// int
+// uptbl_to_kptbl(pagetable_t old, pagetable_t new, uint64 srcva, uint64 add_sz)
+// {
+//   pte_t *pte;
+//   uint64 pa, i;
+//   uint flags;
+//   srcva = PGROUNDUP(srcva);
+//   for(i = srcva; i < srcva + add_sz; i += PGSIZE){
+//     if((pte = walk(old, i, 0)) == 0)
+//       panic("uptbl_to_kptbl: pte should exist");
+//     if((*pte & PTE_V) == 0)
+//       panic("uptbl_to_kptbl: page not present");
+//     pa = PTE2PA(*pte);
+//     flags = PTE_FLAGS(*pte) & ~PTE_U;
+//     if(mappages(new, i, PGSIZE, pa, flags) != 0){
+//       goto err;
+//     }
+//   }
+//   return 0;
+
+//  err:
+//   uvmunmap(new, srcva, i / PGSIZE, 0);
+//   return -1;
+// }
+int
+uptbl_to_kptbl(pagetable_t old, pagetable_t new, uint64 srcva, uint64 add_sz)
+{
+  srcva = PGROUNDUP(srcva);
+  for(uint64 i = srcva; i < srcva + add_sz; i += PGSIZE){
+    pte_t * user_pte = walk(old, i, 0);
+    pte_t * kernel_pte = walk(new, i, 1);
+    if(!user_pte || !kernel_pte)
+      panic("uptbl_to_kptbl mmap failed");
+    *kernel_pte = (*user_pte) & (~PTE_U);
+  }
+  return 0;
+}
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
 void
@@ -379,23 +449,23 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
+  // uint64 n, va0, pa0;
 
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+  // while(len > 0){
+  //   va0 = PGROUNDDOWN(srcva);
+  //   pa0 = walkaddr(pagetable, va0);
+  //   if(pa0 == 0)
+  //     return -1;
+  //   n = PGSIZE - (srcva - va0);
+  //   if(n > len)
+  //     n = len;
+  //   memmove(dst, (void *)(pa0 + (srcva - va0)), n);
 
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  //   len -= n;
+  //   dst += n;
+  //   srcva = va0 + PGSIZE;
+  // }
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -405,38 +475,70 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
+  // uint64 n, va0, pa0;
+  // int got_null = 0;
 
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
+  // while(got_null == 0 && max > 0){
+  //   va0 = PGROUNDDOWN(srcva);
+  //   pa0 = walkaddr(pagetable, va0);
+  //   if(pa0 == 0)
+  //     return -1;
+  //   n = PGSIZE - (srcva - va0);
+  //   if(n > max)
+  //     n = max;
 
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
+  //   char *p = (char *) (pa0 + (srcva - va0));
+  //   while(n > 0){
+  //     if(*p == '\0'){
+  //       *dst = '\0';
+  //       got_null = 1;
+  //       break;
+  //     } else {
+  //       *dst = *p;
+  //     }
+  //     --n;
+  //     --max;
+  //     p++;
+  //     dst++;
+  //   }
+
+  //   srcva = va0 + PGSIZE;
+  // }
+  // if(got_null){
+  //   return 0;
+  // } else {
+  //   return -1;
+  // }
+  return copyinstr_new(pagetable, dst, srcva, max);
+}
+
+void
+vmprint(pagetable_t pagetable)
+{
+  printf("page table %p\n", pagetable);
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if(pte & PTE_V){
+      printf("..%d: pte %p pa %p\n", i, pte, PTE2PA(pte));
+      uint64 child = PTE2PA(pte);
+      pagetable_t child_page = (pagetable_t)child;
+      for(int j = 0; j < 512; j++)
+      {
+        pte_t pte2 = child_page[j];
+        if(pte2 & PTE_V){
+          printf(".. ..%d: pte %p pa %p\n", j, pte2, PTE2PA(pte2));
+          uint64 child2 = PTE2PA(pte2);
+          pagetable_t child_page2 = (pagetable_t)child2;
+          for(int k = 0; k < 512; k++)
+          {
+            pte_t pte3 = child_page2[k];
+            if(pte3 & PTE_V)
+            {
+              printf(".. .. ..%d: pte %p pa %p\n", k, pte3, PTE2PA(pte3));
+            }
+          }
+        }
       }
-      --n;
-      --max;
-      p++;
-      dst++;
     }
-
-    srcva = va0 + PGSIZE;
-  }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
   }
 }
